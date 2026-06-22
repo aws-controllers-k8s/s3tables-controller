@@ -107,6 +107,11 @@ resources:
       terminal_codes:
         - BadRequestException
     hooks:
+      # metadataLocation is a Put-only field (not part of CreateTable; applied
+      # via UpdateTableMetadataLocation). When desired, requeue after create so
+      # the next reconciliation detects the delta and customUpdateTable syncs it.
+      sdk_create_post_set_output:
+        template_path: hooks/table/sdk_create_post_set_output.go.tpl
       # GetTable accepts name triplet OR tableArn; clear tableArn so the read
       # uses the name triplet (ACK populates both).
       sdk_read_one_post_build_request:
