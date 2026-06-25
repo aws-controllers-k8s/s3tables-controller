@@ -123,7 +123,49 @@ func (rm *resourceManager) setBucketConfigurations(
 		ko.Spec.Policy = polResp.ResourcePolicy
 	}
 
+	maintResp, err := rm.sdkapi.GetTableBucketMaintenanceConfiguration(
+		ctx,
+		&svcsdk.GetTableBucketMaintenanceConfigurationInput{TableBucketARN: arn},
+	)
+	rm.metrics.RecordAPICall("READ_ONE", "GetTableBucketMaintenanceConfiguration", err)
+	if err != nil {
+		return err
+	}
+	if len(maintResp.Configuration) > 0 {
+		cfg := make(map[string]*svcapitypes.TableBucketMaintenanceConfigurationValue, len(maintResp.Configuration))
+		for jobType, val := range maintResp.Configuration {
+			cfg[jobType] = maintenanceValueFromSDK(val)
+		}
+		ko.Spec.MaintenanceConfiguration = cfg
+	} else {
+		ko.Spec.MaintenanceConfiguration = nil
+	}
+
 	return nil
+}
+
+// maintenanceValueFromSDK maps an SDK maintenance configuration value into the
+// generated ACK API type, unwrapping the settings union.
+func maintenanceValueFromSDK(
+	val svcsdktypes.TableBucketMaintenanceConfigurationValue,
+) *svcapitypes.TableBucketMaintenanceConfigurationValue {
+	out := &svcapitypes.TableBucketMaintenanceConfigurationValue{}
+	if val.Status != "" {
+		out.Status = aws.String(string(val.Status))
+	}
+	if s, ok := val.Settings.(*svcsdktypes.TableBucketMaintenanceSettingsMemberIcebergUnreferencedFileRemoval); ok {
+		settings := &svcapitypes.IcebergUnreferencedFileRemovalSettings{}
+		if s.Value.NonCurrentDays != nil {
+			settings.NonCurrentDays = aws.Int64(int64(*s.Value.NonCurrentDays))
+		}
+		if s.Value.UnreferencedDays != nil {
+			settings.UnreferencedDays = aws.Int64(int64(*s.Value.UnreferencedDays))
+		}
+		out.Settings = &svcapitypes.TableBucketMaintenanceSettings{
+			IcebergUnreferencedFileRemoval: settings,
+		}
+	}
+	return out
 }
 
 // customUpdateTableBucket applies the mutable bucket-level configuration via
@@ -173,6 +215,11 @@ func (rm *resourceManager) customUpdateTableBucket(
 			return nil, err
 		}
 	}
+	if delta.DifferentAt("Spec.MaintenanceConfiguration") {
+		if err := rm.syncMaintenance(ctx, desired, latest, arn); err != nil {
+			return nil, err
+		}
+	}
 
 	return &resource{ko}, nil
 }
@@ -207,6 +254,83 @@ func (rm *resourceManager) syncPolicy(
 	)
 	rm.metrics.RecordAPICall("UPDATE", "PutTableBucketPolicy", err)
 	return err
+}
+
+// syncMaintenance applies the desired bucket-level maintenance configuration
+// via PutTableBucketMaintenanceConfiguration, one call per maintenance type.
+//
+// There is no DeleteTableBucketMaintenanceConfiguration API and the config
+// always exists (a new bucket defaults to enabled), so a maintenance type
+// present on the bucket but dropped from the desired spec is disabled with an
+// explicit status=disabled Put rather than removed.
+func (rm *resourceManager) syncMaintenance(
+	ctx context.Context,
+	desired *resource,
+	latest *resource,
+	arn *string,
+) (err error) {
+	rlog := ackrtlog.FromContext(ctx)
+	exit := rlog.Trace("rm.syncMaintenance")
+	defer func() { exit(err) }()
+
+	// Disable any maintenance type the bucket currently has but the desired
+	// spec no longer declares. Clearing the field cannot delete the config, so
+	// "removed from spec" is applied as status=disabled.
+	for jobType := range latest.ko.Spec.MaintenanceConfiguration {
+		if _, ok := desired.ko.Spec.MaintenanceConfiguration[jobType]; ok {
+			continue
+		}
+		_, err = rm.sdkapi.PutTableBucketMaintenanceConfiguration(
+			ctx,
+			&svcsdk.PutTableBucketMaintenanceConfigurationInput{
+				TableBucketARN: arn,
+				Type:           svcsdktypes.TableBucketMaintenanceType(jobType),
+				Value: &svcsdktypes.TableBucketMaintenanceConfigurationValue{
+					Status: svcsdktypes.MaintenanceStatusDisabled,
+				},
+			},
+		)
+		rm.metrics.RecordAPICall("UPDATE", "PutTableBucketMaintenanceConfiguration", err)
+		if err != nil {
+			return err
+		}
+	}
+
+	for jobType, val := range desired.ko.Spec.MaintenanceConfiguration {
+		if val == nil {
+			continue
+		}
+		sdkVal := &svcsdktypes.TableBucketMaintenanceConfigurationValue{}
+		if val.Status != nil {
+			sdkVal.Status = svcsdktypes.MaintenanceStatus(*val.Status)
+		}
+		if val.Settings != nil && val.Settings.IcebergUnreferencedFileRemoval != nil {
+			s := val.Settings.IcebergUnreferencedFileRemoval
+			settings := svcsdktypes.IcebergUnreferencedFileRemovalSettings{}
+			if s.NonCurrentDays != nil {
+				settings.NonCurrentDays = aws.Int32(int32(*s.NonCurrentDays))
+			}
+			if s.UnreferencedDays != nil {
+				settings.UnreferencedDays = aws.Int32(int32(*s.UnreferencedDays))
+			}
+			sdkVal.Settings = &svcsdktypes.TableBucketMaintenanceSettingsMemberIcebergUnreferencedFileRemoval{
+				Value: settings,
+			}
+		}
+		_, err = rm.sdkapi.PutTableBucketMaintenanceConfiguration(
+			ctx,
+			&svcsdk.PutTableBucketMaintenanceConfigurationInput{
+				TableBucketARN: arn,
+				Type:           svcsdktypes.TableBucketMaintenanceType(jobType),
+				Value:          sdkVal,
+			},
+		)
+		rm.metrics.RecordAPICall("UPDATE", "PutTableBucketMaintenanceConfiguration", err)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // syncTags reconciles the desired tag set against the latest observed tag set

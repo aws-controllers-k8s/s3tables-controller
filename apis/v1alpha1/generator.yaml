@@ -236,6 +236,18 @@ resources:
         from:
           operation: GetTableBucketPolicy
           path: ResourcePolicy
+      # Bucket-level Iceberg maintenance config. Not part of CreateTableBucket
+      # or GetTableBucket — managed via the dedicated
+      # Put/GetTableBucketMaintenanceConfiguration APIs. Sourced here so the
+      # field is generated; populated in the read hook and synced in update.
+      # No late_initialize: the API defaults day values on a partial Put, so
+      # back-filling the observed (fuller) config into an unset/partial spec
+      # would produce a permanent delta and re-Put on every reconcile. The
+      # delta compares only the sub-fields the user declared (see delta.go).
+      MaintenanceConfiguration:
+        from:
+          operation: GetTableBucketMaintenanceConfiguration
+          path: Configuration
     exceptions:
       errors:
         404:
