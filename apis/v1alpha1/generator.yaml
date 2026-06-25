@@ -226,6 +226,16 @@ resources:
       StorageClassConfiguration:
         late_initialize:
           skip_incomplete_check: {}
+      # Bucket-level Iceberg maintenance config. Not part of CreateTableBucket
+      # or GetTableBucket — managed via the dedicated
+      # Put/GetTableBucketMaintenanceConfiguration APIs. Sourced here so the
+      # field is generated; populated in the read hook and synced in update.
+      MaintenanceConfiguration:
+        from:
+          operation: GetTableBucketMaintenanceConfiguration
+          path: Configuration
+        late_initialize:
+          skip_incomplete_check: {}
     exceptions:
       errors:
         404:
