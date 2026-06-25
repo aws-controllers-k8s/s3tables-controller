@@ -226,6 +226,18 @@ resources:
       StorageClassConfiguration:
         late_initialize:
           skip_incomplete_check: {}
+      # Bucket resource policy (JSON). Not part of CreateTableBucket or
+      # GetTableBucket — managed via the dedicated
+      # Put/Get/DeleteTableBucketPolicy APIs. Populated in the read hook and
+      # synced in update. Late-init so an adopted bucket's existing policy is
+      # captured and drift is detectable.
+      Policy:
+        is_iam_policy: true
+        from:
+          operation: GetTableBucketPolicy
+          path: ResourcePolicy
+        late_initialize:
+          skip_incomplete_check: {}
     exceptions:
       errors:
         404:
