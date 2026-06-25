@@ -12,6 +12,7 @@
 # permissions and limitations under the License.
 """Integration tests for the S3 Tables TableBucket resource."""
 
+import json
 import time
 
 import pytest
@@ -192,3 +193,67 @@ class TestTableBucket:
         time.sleep(DELETE_WAIT_AFTER_SECONDS)
 
         assert get_table_bucket(s3tables_client, arn) is None
+
+    def test_adopt(self, s3tables_client):
+        # On an adopted bucket the ARN is not yet in status; the
+        # sdk_read_one_pre_build_request hook synthesizes it from Spec.Name so
+        # GetTableBucket (which takes only the ARN) can find the bucket.
+        table_bucket_name = random_suffix_name("ack-test-adopt", 32)
+
+        # Create a bucket out-of-band (directly in AWS) for the controller to
+        # adopt.
+        create_resp = s3tables_client.create_table_bucket(name=table_bucket_name)
+        arn = create_resp["arn"]
+
+        adopt_ref = None
+        try:
+            adopt_cr_name = table_bucket_name
+            # The yaml template wraps this in double quotes, so escape the JSON
+            # quotes to keep the manifest valid YAML after substitution.
+            adoption_fields = json.dumps({
+                "name": table_bucket_name,
+            }).replace('"', '\\"')
+            replacements = REPLACEMENT_VALUES.copy()
+            replacements["TABLE_BUCKET_ADOPTION_CR_NAME"] = adopt_cr_name
+            replacements["ADOPTION_FIELDS"] = adoption_fields
+
+            adopt_data = load_s3tables_resource(
+                "table_bucket_adoption", additional_replacements=replacements
+            )
+            adopt_ref = k8s.CustomResourceReference(
+                CRD_GROUP, CRD_VERSION, RESOURCE_PLURAL,
+                adopt_cr_name, namespace="default",
+            )
+            k8s.create_custom_resource(adopt_ref, adopt_data)
+            k8s.wait_resource_consumed_by_controller(adopt_ref)
+            time.sleep(CREATE_WAIT_AFTER_SECONDS)
+
+            assert k8s.wait_on_condition(
+                adopt_ref, condition.CONDITION_TYPE_RESOURCE_SYNCED, "True",
+                wait_periods=20,
+            )
+
+            # The adopted resource should have its spec/status populated from
+            # the existing AWS bucket (read after the ARN was synthesized).
+            cr = k8s.get_resource(adopt_ref)
+            assert cr["spec"]["name"] == table_bucket_name
+            assert cr["status"]["ackResourceMetadata"]["arn"] == arn
+
+            # Deleting the CR removes the K8s object. The adoption manifest sets
+            # deletion-policy: retain, so the underlying AWS bucket is preserved.
+            _, deleted = k8s.delete_custom_resource(adopt_ref)
+            assert deleted
+            time.sleep(DELETE_WAIT_AFTER_SECONDS)
+
+            assert get_table_bucket(s3tables_client, arn) is not None
+            adopt_ref = None
+        finally:
+            if adopt_ref is not None and k8s.get_resource_exists(adopt_ref):
+                k8s.delete_custom_resource(adopt_ref)
+                time.sleep(DELETE_WAIT_AFTER_SECONDS)
+            # Best-effort cleanup if the bucket still exists in AWS.
+            if get_table_bucket(s3tables_client, arn):
+                try:
+                    s3tables_client.delete_table_bucket(tableBucketARN=arn)
+                except Exception:
+                    pass

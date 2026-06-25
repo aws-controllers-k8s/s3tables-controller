@@ -237,6 +237,8 @@ resources:
       terminal_codes:
         - BadRequestException
     hooks:
+      sdk_read_one_pre_build_request:
+        template_path: hooks/table_bucket/sdk_read_one_pre_build_request.go.tpl
       sdk_read_one_post_set_output:
         template_path: hooks/table_bucket/sdk_read_one_post_set_output.go.tpl
     update_operation:
