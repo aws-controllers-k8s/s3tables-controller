@@ -189,9 +189,9 @@ resources:
       ignore: true
 
   TableBucket:
+    is_arn_primary_key: true
     fields:
       Name:
-        is_primary_key: true
         is_immutable: true
       CreatedAt:
         is_read_only: true
