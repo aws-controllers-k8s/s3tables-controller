@@ -195,9 +195,9 @@ class TestTableBucket:
         assert get_table_bucket(s3tables_client, arn) is None
 
     def test_adopt(self, s3tables_client):
-        # On an adopted bucket the ARN is not yet in status; the
-        # sdk_read_one_pre_build_request hook synthesizes it from Spec.Name so
-        # GetTableBucket (which takes only the ARN) can find the bucket.
+        # GetTableBucket is keyed by the bucket ARN, so the bucket is adopted by
+        # ARN: the adoption-fields annotation carries the ARN, which ACK places
+        # into Status.ackResourceMetadata so ReadOne can find the existing bucket.
         table_bucket_name = random_suffix_name("ack-test-adopt", 32)
 
         # Create a bucket out-of-band (directly in AWS) for the controller to
@@ -211,7 +211,7 @@ class TestTableBucket:
             # The yaml template wraps this in double quotes, so escape the JSON
             # quotes to keep the manifest valid YAML after substitution.
             adoption_fields = json.dumps({
-                "name": table_bucket_name,
+                "arn": arn,
             }).replace('"', '\\"')
             replacements = REPLACEMENT_VALUES.copy()
             replacements["TABLE_BUCKET_ADOPTION_CR_NAME"] = adopt_cr_name
@@ -234,7 +234,7 @@ class TestTableBucket:
             )
 
             # The adopted resource should have its spec/status populated from
-            # the existing AWS bucket (read after the ARN was synthesized).
+            # the existing AWS bucket: ARN in status, name read back into spec.
             cr = k8s.get_resource(adopt_ref)
             assert cr["spec"]["name"] == table_bucket_name
             assert cr["status"]["ackResourceMetadata"]["arn"] == arn
