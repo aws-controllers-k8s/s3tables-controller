@@ -12,6 +12,7 @@
 # permissions and limitations under the License.
 """Integration tests for the S3 Tables TableBucket resource."""
 
+import json
 import time
 
 import pytest
@@ -42,6 +43,30 @@ def get_table_bucket(s3tables_client, arn: str):
         return s3tables_client.get_table_bucket(tableBucketARN=arn)
     except s3tables_client.exceptions.NotFoundException:
         return None
+
+
+@pytest.fixture
+def adopted_bucket_arns(s3tables_client):
+    """Tracks table buckets created out-of-band by adoption tests and reaps any
+    survivors at teardown.
+
+    Adoption tests create a bucket directly in AWS (with deletion-policy:
+    retain, so the CR teardown leaves the bucket in place) and rely on an
+    in-test cleanup. Table buckets are capped by a low per-account quota, so a
+    test that errors or whose worker is interrupted before its own cleanup runs
+    would strand a bucket and, over many runs, exhaust the quota and break
+    unrelated create tests. This teardown deletes only the exact ARNs the test
+    registered here, so it never touches buckets owned by other concurrent CI
+    jobs sharing the account.
+    """
+    arns = []
+    yield arns
+    for arn in arns:
+        if get_table_bucket(s3tables_client, arn) is not None:
+            try:
+                s3tables_client.delete_table_bucket(tableBucketARN=arn)
+            except Exception:
+                pass
 
 
 @service_marker
@@ -192,3 +217,66 @@ class TestTableBucket:
         time.sleep(DELETE_WAIT_AFTER_SECONDS)
 
         assert get_table_bucket(s3tables_client, arn) is None
+
+    def test_adopt(self, s3tables_client, adopted_bucket_arns):
+        # GetTableBucket is keyed by the bucket ARN, so the bucket is adopted by
+        # ARN: the adoption-fields annotation carries the ARN, which ACK places
+        # into Status.ackResourceMetadata so ReadOne can find the existing bucket.
+        table_bucket_name = random_suffix_name("ack-test-adopt", 32)
+
+        # Create a bucket out-of-band (directly in AWS) for the controller to
+        # adopt. Register it for teardown immediately so the bucket is reaped
+        # even if this test errors before its own cleanup runs (the adoption
+        # manifest uses deletion-policy: retain, so nothing else removes it).
+        create_resp = s3tables_client.create_table_bucket(name=table_bucket_name)
+        arn = create_resp["arn"]
+        adopted_bucket_arns.append(arn)
+
+        adopt_ref = None
+        try:
+            adopt_cr_name = table_bucket_name
+            # The yaml template wraps this in double quotes, so escape the JSON
+            # quotes to keep the manifest valid YAML after substitution.
+            adoption_fields = json.dumps({
+                "arn": arn,
+            }).replace('"', '\\"')
+            replacements = REPLACEMENT_VALUES.copy()
+            replacements["TABLE_BUCKET_ADOPTION_CR_NAME"] = adopt_cr_name
+            replacements["ADOPTION_FIELDS"] = adoption_fields
+
+            adopt_data = load_s3tables_resource(
+                "table_bucket_adoption", additional_replacements=replacements
+            )
+            adopt_ref = k8s.CustomResourceReference(
+                CRD_GROUP, CRD_VERSION, RESOURCE_PLURAL,
+                adopt_cr_name, namespace="default",
+            )
+            k8s.create_custom_resource(adopt_ref, adopt_data)
+            k8s.wait_resource_consumed_by_controller(adopt_ref)
+            time.sleep(CREATE_WAIT_AFTER_SECONDS)
+
+            assert k8s.wait_on_condition(
+                adopt_ref, condition.CONDITION_TYPE_RESOURCE_SYNCED, "True",
+                wait_periods=20,
+            )
+
+            # The adopted resource should have its spec/status populated from
+            # the existing AWS bucket: ARN in status, name read back into spec.
+            cr = k8s.get_resource(adopt_ref)
+            assert cr["spec"]["name"] == table_bucket_name
+            assert cr["status"]["ackResourceMetadata"]["arn"] == arn
+
+            # Deleting the CR removes the K8s object. The adoption manifest sets
+            # deletion-policy: retain, so the underlying AWS bucket is preserved.
+            _, deleted = k8s.delete_custom_resource(adopt_ref)
+            assert deleted
+            time.sleep(DELETE_WAIT_AFTER_SECONDS)
+
+            assert get_table_bucket(s3tables_client, arn) is not None
+            adopt_ref = None
+        finally:
+            # Remove the K8s object if the test left it behind. The underlying
+            # AWS bucket is reaped by the adopted_bucket_arns fixture.
+            if adopt_ref is not None and k8s.get_resource_exists(adopt_ref):
+                k8s.delete_custom_resource(adopt_ref)
+                time.sleep(DELETE_WAIT_AFTER_SECONDS)
