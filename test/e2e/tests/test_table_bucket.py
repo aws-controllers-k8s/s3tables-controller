@@ -399,9 +399,30 @@ class TestTableBucket:
         assert settings["unreferencedDays"] == 7
         assert settings["nonCurrentDays"] == 5
 
-        # Disable maintenance by clearing the field. There is no delete API, so
-        # the controller applies status=disabled rather than removing the config.
+        # Clearing the field leaves the config alone (the field is
+        # late-initialized): the service default is preserved rather than
+        # disabled, so maintenance stays enabled. To turn it off, status must be
+        # set to disabled explicitly.
         k8s.patch_custom_resource(ref, {"spec": {"maintenanceConfiguration": None}})
+        time.sleep(MODIFY_WAIT_AFTER_SECONDS)
+        assert k8s.wait_on_condition(
+            ref, condition.CONDITION_TYPE_RESOURCE_SYNCED, "True", wait_periods=10,
+        )
+        cfg = s3tables_client.get_table_bucket_maintenance_configuration(
+            tableBucketARN=arn
+        )["configuration"]
+        assert cfg["icebergUnreferencedFileRemoval"]["status"] == "enabled"
+
+        # Disable maintenance explicitly via status=disabled (there is no delete
+        # API; the config always exists).
+        disable = {
+            "spec": {
+                "maintenanceConfiguration": {
+                    "icebergUnreferencedFileRemoval": {"status": "disabled"},
+                },
+            },
+        }
+        k8s.patch_custom_resource(ref, disable)
         time.sleep(MODIFY_WAIT_AFTER_SECONDS)
         assert k8s.wait_on_condition(
             ref, condition.CONDITION_TYPE_RESOURCE_SYNCED, "True", wait_periods=10,

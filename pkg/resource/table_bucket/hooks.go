@@ -16,14 +16,28 @@ package table_bucket
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 
 	ackcompare "github.com/aws-controllers-k8s/runtime/pkg/compare"
+	ackerr "github.com/aws-controllers-k8s/runtime/pkg/errors"
 	ackrtlog "github.com/aws-controllers-k8s/runtime/pkg/runtime/log"
 	svcapitypes "github.com/aws-controllers-k8s/s3tables-controller/apis/v1alpha1"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	svcsdk "github.com/aws/aws-sdk-go-v2/service/s3tables"
 	svcsdktypes "github.com/aws/aws-sdk-go-v2/service/s3tables/types"
 )
+
+// maintenanceDaysToInt32 narrows a CRD int64 day value to the SDK's int32,
+// returning an error rather than silently overflowing. The CRD models these as
+// int64 but the S3 Tables API is int32; without the guard a value above the
+// int32 max would wrap to a negative number and be sent to AWS.
+func maintenanceDaysToInt32(v int64) (int32, error) {
+	if v < 0 || v > math.MaxInt32 {
+		return 0, fmt.Errorf("value %d out of range for int32 (0..%d)", v, math.MaxInt32)
+	}
+	return int32(v), nil
+}
 
 // arnFromKO returns the resource ARN string pointer from the resource's status
 // metadata, or nil if it has not yet been populated.
@@ -131,11 +145,23 @@ func (rm *resourceManager) setBucketConfigurations(
 	if err != nil {
 		return err
 	}
-	if len(maintResp.Configuration) > 0 {
-		cfg := make(map[string]*svcapitypes.TableBucketMaintenanceConfigurationValue, len(maintResp.Configuration))
-		for jobType, val := range maintResp.Configuration {
-			cfg[jobType] = maintenanceValueFromSDK(val)
+	cfg := make(map[string]*svcapitypes.TableBucketMaintenanceConfigurationValue, len(maintResp.Configuration))
+	for jobType, val := range maintResp.Configuration {
+		// Only map maintenance types this controller understands. A new
+		// service-side type would otherwise be half-mapped (status captured but
+		// its settings union member unrecognized and dropped), producing a spec
+		// that cannot round-trip. Skip unknown types so they are neither
+		// surfaced nor mutated; they can be added when the CRD supports them.
+		if jobType != string(svcsdktypes.TableBucketMaintenanceTypeIcebergUnreferencedFileRemoval) {
+			rlog.Info(
+				"skipping unrecognized table bucket maintenance type",
+				"type", jobType,
+			)
+			continue
 		}
+		cfg[jobType] = maintenanceValueFromSDK(val)
+	}
+	if len(cfg) > 0 {
 		ko.Spec.MaintenanceConfiguration = cfg
 	} else {
 		ko.Spec.MaintenanceConfiguration = nil
@@ -216,12 +242,72 @@ func (rm *resourceManager) customUpdateTableBucket(
 		}
 	}
 	if delta.DifferentAt("Spec.MaintenanceConfiguration") {
-		if err := rm.syncMaintenance(ctx, desired, latest, arn); err != nil {
+		if err := rm.syncMaintenance(ctx, desired, arn); err != nil {
 			return nil, err
 		}
 	}
 
 	return &resource{ko}, nil
+}
+
+// customDeltaPostCompare adds a Spec.MaintenanceConfiguration difference to the
+// delta using a field-aware comparison. The field is compare.is_ignored because
+// the generated whole-map DeepEqual churns a partial spec against the AWS-
+// defaulted observed config; this hook restores accurate diffing so genuine
+// changes still drive an update while partial configs do not churn.
+func customDeltaPostCompare(
+	delta *ackcompare.Delta,
+	a *resource,
+	b *resource,
+) {
+	if maintenanceNeedsSync(a.ko.Spec.MaintenanceConfiguration, b.ko.Spec.MaintenanceConfiguration) {
+		delta.Add("Spec.MaintenanceConfiguration", a.ko.Spec.MaintenanceConfiguration, b.ko.Spec.MaintenanceConfiguration)
+	}
+}
+
+// maintenanceNeedsSync reports whether the desired (a) maintenance configuration
+// differs from what is observed on the bucket (b), comparing only the sub-fields
+// the user actually declared. A nil desired sub-field (status or a day value)
+// means "adopt whatever AWS defaulted" and is not a difference, so a partial
+// config does not churn.
+//
+// A maintenance type observed on the bucket but absent from the desired spec is
+// left alone: the field is late-initialized, so an unset spec adopts the
+// observed config rather than disabling it. There is no delete API and the
+// service defaults maintenance to enabled; disabling requires an explicit
+// status: disabled in the spec.
+func maintenanceNeedsSync(
+	desired, latest map[string]*svcapitypes.TableBucketMaintenanceConfigurationValue,
+) bool {
+	for jobType, d := range desired {
+		if d == nil {
+			continue
+		}
+		l := latest[jobType]
+		if l == nil {
+			return true
+		}
+		if d.Status != nil && (l.Status == nil || *d.Status != *l.Status) {
+			return true
+		}
+		if d.Settings != nil && d.Settings.IcebergUnreferencedFileRemoval != nil {
+			ds := d.Settings.IcebergUnreferencedFileRemoval
+			var ls *svcapitypes.IcebergUnreferencedFileRemovalSettings
+			if l.Settings != nil {
+				ls = l.Settings.IcebergUnreferencedFileRemoval
+			}
+			if ls == nil {
+				return true
+			}
+			if ds.UnreferencedDays != nil && (ls.UnreferencedDays == nil || *ds.UnreferencedDays != *ls.UnreferencedDays) {
+				return true
+			}
+			if ds.NonCurrentDays != nil && (ls.NonCurrentDays == nil || *ds.NonCurrentDays != *ls.NonCurrentDays) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // syncPolicy applies the desired bucket resource policy. An empty/absent policy
@@ -266,36 +352,15 @@ func (rm *resourceManager) syncPolicy(
 func (rm *resourceManager) syncMaintenance(
 	ctx context.Context,
 	desired *resource,
-	latest *resource,
 	arn *string,
 ) (err error) {
 	rlog := ackrtlog.FromContext(ctx)
 	exit := rlog.Trace("rm.syncMaintenance")
 	defer func() { exit(err) }()
 
-	// Disable any maintenance type the bucket currently has but the desired
-	// spec no longer declares. Clearing the field cannot delete the config, so
-	// "removed from spec" is applied as status=disabled.
-	for jobType := range latest.ko.Spec.MaintenanceConfiguration {
-		if _, ok := desired.ko.Spec.MaintenanceConfiguration[jobType]; ok {
-			continue
-		}
-		_, err = rm.sdkapi.PutTableBucketMaintenanceConfiguration(
-			ctx,
-			&svcsdk.PutTableBucketMaintenanceConfigurationInput{
-				TableBucketARN: arn,
-				Type:           svcsdktypes.TableBucketMaintenanceType(jobType),
-				Value: &svcsdktypes.TableBucketMaintenanceConfigurationValue{
-					Status: svcsdktypes.MaintenanceStatusDisabled,
-				},
-			},
-		)
-		rm.metrics.RecordAPICall("UPDATE", "PutTableBucketMaintenanceConfiguration", err)
-		if err != nil {
-			return err
-		}
-	}
-
+	// Apply each maintenance type the user declared. Types not in the spec are
+	// left alone (the field is late-initialized), so an unset config keeps the
+	// AWS default. Disabling requires an explicit status: disabled.
 	for jobType, val := range desired.ko.Spec.MaintenanceConfiguration {
 		if val == nil {
 			continue
@@ -308,10 +373,18 @@ func (rm *resourceManager) syncMaintenance(
 			s := val.Settings.IcebergUnreferencedFileRemoval
 			settings := svcsdktypes.IcebergUnreferencedFileRemovalSettings{}
 			if s.NonCurrentDays != nil {
-				settings.NonCurrentDays = aws.Int32(int32(*s.NonCurrentDays))
+				v, cerr := maintenanceDaysToInt32(*s.NonCurrentDays)
+				if cerr != nil {
+					return ackerr.NewTerminalError(fmt.Errorf("nonCurrentDays: %w", cerr))
+				}
+				settings.NonCurrentDays = aws.Int32(v)
 			}
 			if s.UnreferencedDays != nil {
-				settings.UnreferencedDays = aws.Int32(int32(*s.UnreferencedDays))
+				v, cerr := maintenanceDaysToInt32(*s.UnreferencedDays)
+				if cerr != nil {
+					return ackerr.NewTerminalError(fmt.Errorf("unreferencedDays: %w", cerr))
+				}
+				settings.UnreferencedDays = aws.Int32(v)
 			}
 			sdkVal.Settings = &svcsdktypes.TableBucketMaintenanceSettingsMemberIcebergUnreferencedFileRemoval{
 				Value: settings,
