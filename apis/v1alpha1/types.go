@@ -40,7 +40,8 @@ type EncryptionConfiguration struct {
 
 // Contains details about the compaction settings for an Iceberg table.
 type IcebergCompactionSettings struct {
-	TargetFileSizeMB *int64 `json:"targetFileSizeMB,omitempty"`
+	Strategy         *string `json:"strategy,omitempty"`
+	TargetFileSizeMB *int64  `json:"targetFileSizeMB,omitempty"`
 }
 
 // Contains details about the metadata for an Iceberg table.
@@ -193,13 +194,26 @@ type TableBucketSummary struct {
 
 // The values that define a maintenance configuration for a table.
 type TableMaintenanceConfigurationValue struct {
-	Status *string `json:"status,omitempty"`
+	// Contains details about maintenance settings for the table.
+	Settings *TableMaintenanceSettings `json:"settings,omitempty"`
+	Status   *string                   `json:"status,omitempty"`
 }
 
 // Details about the status of a maintenance job.
 type TableMaintenanceJobStatusValue struct {
 	FailureMessage   *string      `json:"failureMessage,omitempty"`
 	LastRunTimestamp *metav1.Time `json:"lastRunTimestamp,omitempty"`
+}
+
+// Contains details about maintenance settings for the table.
+type TableMaintenanceSettings struct {
+	// Contains details about the compaction settings for an Iceberg table.
+	IcebergCompaction *IcebergCompactionSettings `json:"icebergCompaction,omitempty"`
+	// Contains details about the snapshot management settings for an Iceberg table.
+	// The oldest snapshot expires when its age exceeds the maxSnapshotAgeHours
+	// and the total number of snapshots exceeds the value for the minimum number
+	// of snapshots to keep minSnapshotsToKeep.
+	IcebergSnapshotManagement *IcebergSnapshotManagementSettings `json:"icebergSnapshotManagement,omitempty"`
 }
 
 // Contains details about the table metadata.

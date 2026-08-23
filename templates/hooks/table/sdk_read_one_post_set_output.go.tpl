@@ -21,3 +21,8 @@
 	if err := rm.setResourceTags(ctx, ko); err != nil {
 		return nil, err
 	}
+	// GetTable does not return the maintenance configuration either; it has a
+	// dedicated GetTableMaintenanceConfiguration API.
+	if err := rm.setMaintenanceConfiguration(ctx, ko); err != nil {
+		return nil, err
+	}

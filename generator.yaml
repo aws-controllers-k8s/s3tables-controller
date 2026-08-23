@@ -86,6 +86,30 @@ resources:
         from:
           operation: GetTable
           path: WarehouseLocation
+      # Table-level Iceberg maintenance config (compaction and snapshot
+      # management). Not part of CreateTable or GetTable — managed via the
+      # dedicated Put/GetTableMaintenanceConfiguration APIs. Sourced here so the
+      # field is generated; populated in the read hook and synced in update.
+      #
+      # late_initialize: an unset field is left alone. The read hook populates
+      # the observed config and late-init copies it into spec, so the AWS
+      # default (currently both types enabled) is preserved rather than being
+      # disabled. We deliberately do NOT hard-code a default, so if the service
+      # default changes ACK reflects the actual observed value. To turn a
+      # maintenance type off, set status: disabled explicitly.
+      #
+      # compare.is_ignored: the generated delta does a whole-map DeepEqual,
+      # which never matches a partial spec against the AWS-defaulted observed
+      # config and would re-Put every reconcile. customUpdateTable does a
+      # field-aware comparison instead (only sub-fields the user declared).
+      MaintenanceConfiguration:
+        compare:
+          is_ignored: true
+        from:
+          operation: GetTableMaintenanceConfiguration
+          path: Configuration
+        late_initialize:
+          skip_incomplete_check: {}
       CreatedAt:
         is_read_only: true
         from:
@@ -116,8 +140,15 @@ resources:
       # the scalar Spec.Namespace and fetch tags via ListTagsForResource.
       sdk_read_one_post_set_output:
         template_path: hooks/table/sdk_read_one_post_set_output.go.tpl
+      # MaintenanceConfiguration is compare.is_ignored (the generated whole-map
+      # DeepEqual churns a partial spec against the AWS-defaulted config). Add a
+      # field-aware comparison so Spec.MaintenanceConfiguration deltas are still
+      # detected and drive an update.
+      delta_post_compare:
+        code: customDeltaPostCompare(delta, a, b)
     # No generic Update API: name is changed via RenameTable, tags via
-    # TagResource/UntagResource. Everything else is immutable.
+    # TagResource/UntagResource, maintenance via
+    # PutTableMaintenanceConfiguration. Everything else is immutable.
     update_operation:
       custom_method_name: customUpdateTable
   Namespace:

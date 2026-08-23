@@ -252,3 +252,120 @@ class TestTable:
                     )
                 except Exception:
                     pass
+
+    def test_maintenance_configuration(self, s3tables_client, namespace):
+        # Table-level maintenance config is a separate API
+        # (Put/GetTableMaintenanceConfiguration), wired via the read hook and
+        # customUpdateTable. The table has two maintenance types, each carrying
+        # its own settings union member.
+        table_bucket = namespace["table_bucket"]
+        table_bucket_arn = table_bucket["arn"]
+        namespace_name = namespace["name"]
+
+        table_ref = None
+        try:
+            table_name = random_suffix_name("ack_test_maint", 24).replace("-", "_")
+            table_cr_name = table_name.replace("_", "-")
+            replacements = REPLACEMENT_VALUES.copy()
+            replacements["TABLE_NAME"] = table_name
+            replacements["TABLE_CR_NAME"] = table_cr_name
+            replacements["TABLE_BUCKET_CR_NAME"] = table_bucket["cr_name"]
+            replacements["NAMESPACE_CR_NAME"] = namespace["cr_name"]
+
+            table_data = load_s3tables_resource(
+                "table", additional_replacements=replacements
+            )
+            table_ref = k8s.CustomResourceReference(
+                CRD_GROUP, CRD_VERSION, TABLE_PLURAL,
+                table_cr_name, namespace="default",
+            )
+            k8s.create_custom_resource(table_ref, table_data)
+            k8s.wait_resource_consumed_by_controller(table_ref)
+            time.sleep(CREATE_WAIT_AFTER_SECONDS)
+            assert k8s.wait_on_condition(
+                table_ref, condition.CONDITION_TYPE_RESOURCE_SYNCED, "True", wait_periods=20,
+            )
+
+            # Set both maintenance types via the dedicated API.
+            updates = {
+                "spec": {
+                    "maintenanceConfiguration": {
+                        "icebergCompaction": {
+                            "status": "enabled",
+                            "settings": {
+                                "icebergCompaction": {
+                                    "strategy": "binpack",
+                                    "targetFileSizeMB": 128,
+                                },
+                            },
+                        },
+                        "icebergSnapshotManagement": {
+                            "status": "enabled",
+                            "settings": {
+                                "icebergSnapshotManagement": {
+                                    "minSnapshotsToKeep": 2,
+                                    "maxSnapshotAgeHours": 48,
+                                },
+                            },
+                        },
+                    },
+                },
+            }
+            k8s.patch_custom_resource(table_ref, updates)
+            time.sleep(MODIFY_WAIT_AFTER_SECONDS)
+            assert k8s.wait_on_condition(
+                table_ref, condition.CONDITION_TYPE_RESOURCE_SYNCED, "True", wait_periods=20,
+            )
+
+            cfg = s3tables_client.get_table_maintenance_configuration(
+                tableBucketARN=table_bucket_arn,
+                namespace=namespace_name,
+                name=table_name,
+            )["configuration"]
+            compaction = cfg["icebergCompaction"]["settings"]["icebergCompaction"]
+            assert compaction["strategy"] == "binpack"
+            assert compaction["targetFileSizeMB"] == 128
+            snapshots = cfg["icebergSnapshotManagement"]["settings"][
+                "icebergSnapshotManagement"
+            ]
+            assert snapshots["minSnapshotsToKeep"] == 2
+            assert snapshots["maxSnapshotAgeHours"] == 48
+
+            # Clearing the field leaves the config alone (the field is
+            # late-initialized): the service default is preserved rather than
+            # disabled. To turn a type off, status must be set to disabled
+            # explicitly.
+            k8s.patch_custom_resource(table_ref, {"spec": {"maintenanceConfiguration": None}})
+            time.sleep(MODIFY_WAIT_AFTER_SECONDS)
+            assert k8s.wait_on_condition(
+                table_ref, condition.CONDITION_TYPE_RESOURCE_SYNCED, "True", wait_periods=20,
+            )
+            cfg = s3tables_client.get_table_maintenance_configuration(
+                tableBucketARN=table_bucket_arn,
+                namespace=namespace_name,
+                name=table_name,
+            )["configuration"]
+            assert cfg["icebergCompaction"]["status"] == "enabled"
+
+            # Disabling requires an explicit status.
+            k8s.patch_custom_resource(table_ref, {
+                "spec": {
+                    "maintenanceConfiguration": {
+                        "icebergCompaction": {"status": "disabled"},
+                    },
+                },
+            })
+            time.sleep(MODIFY_WAIT_AFTER_SECONDS)
+            assert k8s.wait_on_condition(
+                table_ref, condition.CONDITION_TYPE_RESOURCE_SYNCED, "True", wait_periods=20,
+            )
+            cfg = s3tables_client.get_table_maintenance_configuration(
+                tableBucketARN=table_bucket_arn,
+                namespace=namespace_name,
+                name=table_name,
+            )["configuration"]
+            assert cfg["icebergCompaction"]["status"] == "disabled"
+        finally:
+            if table_ref is not None and k8s.get_resource_exists(table_ref):
+                k8s.delete_custom_resource(table_ref)
+                time.sleep(DELETE_WAIT_AFTER_SECONDS)

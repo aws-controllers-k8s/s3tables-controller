@@ -177,6 +177,11 @@ func (rm *resourceManager) sdkFind(
 	if err := rm.setResourceTags(ctx, ko); err != nil {
 		return nil, err
 	}
+	// GetTable does not return the maintenance configuration either; it has a
+	// dedicated GetTableMaintenanceConfiguration API.
+	if err := rm.setMaintenanceConfiguration(ctx, ko); err != nil {
+		return nil, err
+	}
 
 	return &resource{ko}, nil
 }
@@ -255,11 +260,12 @@ func (rm *resourceManager) sdkCreate(
 	}
 
 	rm.setStatusDefaults(ko)
-	// metadataLocation is not part of CreateTable; it can only be applied via
-	// the dedicated UpdateTableMetadataLocation API. When the user supplies a
-	// desired metadataLocation, requeue so the next reconciliation observes the
-	// delta and customUpdateTable syncs it via UpdateTableMetadataLocation.
-	if desired.ko.Spec.MetadataLocation != nil {
+	// metadataLocation and maintenanceConfiguration are not part of CreateTable;
+	// each is applied via its dedicated API (UpdateTableMetadataLocation,
+	// PutTableMaintenanceConfiguration). When the user declares either, requeue
+	// so the next reconciliation observes the delta and customUpdateTable
+	// applies it.
+	if desired.ko.Spec.MetadataLocation != nil || desired.ko.Spec.MaintenanceConfiguration != nil {
 		ackcondition.SetSynced(&resource{ko}, corev1.ConditionFalse, aws.String("table created, requeue for updates"), nil)
 		err = ackrequeue.NeededAfter(fmt.Errorf("Reconciling to sync additional fields"), time.Second)
 		return &resource{ko}, err

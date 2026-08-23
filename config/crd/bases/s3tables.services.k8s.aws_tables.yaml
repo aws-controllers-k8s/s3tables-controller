@@ -77,6 +77,46 @@ spec:
                 x-kubernetes-validations:
                 - message: Value is immutable once set
                   rule: self == oldSelf
+              maintenanceConfiguration:
+                additionalProperties:
+                  description: The values that define a maintenance configuration
+                    for a table.
+                  properties:
+                    settings:
+                      description: Contains details about maintenance settings for
+                        the table.
+                      properties:
+                        icebergCompaction:
+                          description: Contains details about the compaction settings
+                            for an Iceberg table.
+                          properties:
+                            strategy:
+                              type: string
+                            targetFileSizeMB:
+                              format: int64
+                              type: integer
+                          type: object
+                        icebergSnapshotManagement:
+                          description: |-
+                            Contains details about the snapshot management settings for an Iceberg table.
+                            The oldest snapshot expires when its age exceeds the maxSnapshotAgeHours
+                            and the total number of snapshots exceeds the value for the minimum number
+                            of snapshots to keep minSnapshotsToKeep.
+                          properties:
+                            maxSnapshotAgeHours:
+                              format: int64
+                              type: integer
+                            minSnapshotsToKeep:
+                              format: int64
+                              type: integer
+                          type: object
+                      type: object
+                    status:
+                      type: string
+                  type: object
+                description: Details about the maintenance configuration for the table
+                  bucket.
+                type: object
               metadata:
                 description: The metadata for the table.
                 properties:

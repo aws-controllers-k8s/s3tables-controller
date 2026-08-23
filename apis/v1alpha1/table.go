@@ -36,6 +36,8 @@ type TableSpec struct {
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="Value is immutable once set"
 	// +kubebuilder:validation:Required
 	Format *string `json:"format"`
+	// Details about the maintenance configuration for the table bucket.
+	MaintenanceConfiguration map[string]*TableMaintenanceConfigurationValue `json:"maintenanceConfiguration,omitempty"`
 	// The metadata for the table.
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="Value is immutable once set"
 	Metadata *TableMetadata `json:"metadata,omitempty"`
